@@ -8,6 +8,17 @@ export interface PollState<T> {
   refresh: () => void
 }
 
+const refreshListeners = new Set<() => void>()
+
+/**
+ * Refetches every mounted poll in place, without a loading flip. Lets the
+ * sync control push fresh data to the pages as soon as a sync completes,
+ * instead of them waiting out their poll interval.
+ */
+export function refreshPolls() {
+  for (const listener of refreshListeners) listener()
+}
+
 /**
  * Fetches on mount and every `intervalMs` (default 30s), refetching whenever
  * `key` changes. Stale responses from superseded requests are dropped.
@@ -48,9 +59,12 @@ export function usePoll<T>(
 
     void run(true)
     const timer = setInterval(() => void run(false), intervalMs)
+    const listener = () => void run(false)
+    refreshListeners.add(listener)
     return () => {
       alive = false
       clearInterval(timer)
+      refreshListeners.delete(listener)
     }
   }, [key, tick, intervalMs])
 

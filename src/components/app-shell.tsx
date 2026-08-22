@@ -1,5 +1,10 @@
 import * as React from "react"
-import { Link, useNavigate, useSearch } from "@tanstack/react-router"
+import {
+  Link,
+  useMatchRoute,
+  useNavigate,
+  useSearch,
+} from "@tanstack/react-router"
 import {
   CheckIcon,
   ChevronDownIcon,
@@ -10,14 +15,16 @@ import {
   XIcon,
 } from "lucide-react"
 
-import { AGENTS, AGENT_IDS, type AgentId } from "@/lib/agents/registry"
+import { AGENTS, AGENT_IDS } from "@/lib/agents/registry"
+import type { AgentId } from "@/lib/agents/registry"
 import type { StatsFilter, SyncStatus, TimeRange } from "@/lib/api/types"
 import { TIME_RANGES } from "@/lib/api/types"
 import { getJson } from "@/components/data/api"
-import { usePoll } from "@/components/data/use-poll"
+import { refreshPolls, usePoll } from "@/components/data/use-poll"
 import { formatRelative } from "@/components/data/format"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { UsageShareSheet } from "@/components/share-usage"
 import {
   Popover,
   PopoverContent,
@@ -56,7 +63,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 }
 
 function useFilter(): StatsFilter {
-  const search = useSearch({ strict: false }) as Partial<StatsFilter>
+  const search = useSearch({ strict: false })
   return {
     range: search.range ?? "30d",
     agents: search.agents,
@@ -78,7 +85,12 @@ function AppHeader() {
           className="flex items-center gap-2.5"
           aria-label="Telemetry Stats overview"
         >
-          <svg viewBox="0 0 114.6 115" className="size-5" fill="currentColor" aria-hidden>
+          <svg
+            viewBox="0 0 114.6 115"
+            className="size-5"
+            fill="currentColor"
+            aria-hidden
+          >
             <path d="M28.3 17.8C26.8 17.8 26.1 15.9 27.4 14.9C34.3 10.6 43.7 5.8 57.3 5.8C70.9 5.8 80.3 10.6 87.2 14.9C88.5 15.9 87.8 17.8 86.3 17.8Z" />
             <path d="M19.8 22.9H94.8Q96.3 22.9 97.04 24.2Q100.1 27.95 101.76 32.5Q102.5 33.8 101 33.8H77.3C71.3 33.8 68.6 32 65.8 31C63 30 61.4 29.2 57.3 29.2C53.2 29.2 51.6 30 48.8 31C46 32 43.3 33.8 37.3 33.8H13.6Q12.1 33.8 12.84 32.5Q14.5 27.95 17.56 24.2Q18.3 22.9 19.8 22.9Z" />
             <path d="M34.2 38.8C35.6 38.8 36.3 40.3 35.6 41.4C34.7 42.6 33.4 45.4 32.9 46.9C32.4 48.3 30.8 49.3 29.9 49.3H7.8C7 49.3 6.3 48.5 6.4 47.2C6.7 45.2 7.4 42.1 8.1 40C8.4 39.35 9.1 38.8 9.55 38.8Z" />
@@ -137,8 +149,10 @@ function AppHeader() {
 }
 
 function Toolbar() {
-  const search = useSearch({ strict: false }) as Partial<StatsFilter>
+  const search = useSearch({ strict: false })
   const navigate = useNavigate()
+  const matchRoute = useMatchRoute()
+  const filter = useFilter()
   const range = search.range ?? "30d"
   const agents = search.agents ?? []
   const models = search.models ?? []
@@ -197,26 +211,29 @@ function Toolbar() {
           />
         ))}
       </div>
-      <div
-        role="group"
-        aria-label="Date range"
-        className="flex rounded-md border p-0.5"
-      >
-        {TIME_RANGES.map((value) => (
-          <button
-            key={value}
-            type="button"
-            aria-pressed={range === value}
-            onClick={() => setRange(value)}
-            className={`min-h-10 rounded-[calc(var(--radius)-2px)] px-2.5 text-[13px] tabular-nums focus-visible:ring-2 focus-visible:ring-ring md:min-h-7 ${
-              range === value
-                ? "bg-muted font-medium text-foreground"
-                : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            {RANGE_LABELS[value]}
-          </button>
-        ))}
+      <div className="flex flex-wrap items-center gap-2">
+        <div
+          role="group"
+          aria-label="Date range"
+          className="flex rounded-md border p-0.5"
+        >
+          {TIME_RANGES.map((value) => (
+            <button
+              key={value}
+              type="button"
+              aria-pressed={range === value}
+              onClick={() => setRange(value)}
+              className={`min-h-10 rounded-[calc(var(--radius)-2px)] px-2.5 text-[13px] tabular-nums focus-visible:ring-2 focus-visible:ring-ring md:min-h-7 ${
+                range === value
+                  ? "bg-muted font-medium text-foreground"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {RANGE_LABELS[value]}
+            </button>
+          ))}
+        </div>
+        {matchRoute({ to: "/" }) ? <UsageShareSheet filter={filter} /> : null}
       </div>
     </div>
   )
@@ -336,7 +353,28 @@ function AgentFilter({
 }
 
 function SyncControl() {
-  const poll = usePoll(() => getJson<SyncStatus>("/api/sync"), "sync", 5_000)
+  // undefined = no status seen yet; null = seen, but no finished run.
+  const lastFinished = React.useRef<number | null | undefined>(undefined)
+  const poll = usePoll(
+    async () => {
+      const status = await getJson<SyncStatus>("/api/sync")
+      const finishedAt = status.lastRun?.finishedAt ?? null
+      // A new finishedAt means a sync completed (here, another tab, or the
+      // CLI): push the new rows to the open page instead of waiting out the
+      // 30s data poll.
+      if (
+        lastFinished.current !== undefined &&
+        finishedAt !== null &&
+        finishedAt !== lastFinished.current
+      ) {
+        refreshPolls()
+      }
+      lastFinished.current = finishedAt
+      return status
+    },
+    "sync",
+    5_000
+  )
   const [starting, setStarting] = React.useState(false)
   const running = starting || (poll.data?.running ?? false)
   const finishedAt = poll.data?.lastRun?.finishedAt ?? null
@@ -406,6 +444,7 @@ function GitHubLink() {
       size="icon"
       aria-label="GitHub repository"
       className="min-h-11 min-w-11 md:min-h-8 md:min-w-8"
+      nativeButton={false}
       render={
         <a
           href="https://github.com/telemetry-dev/stats"
@@ -414,7 +453,12 @@ function GitHubLink() {
         />
       }
     >
-      <svg viewBox="0 0 16 16" className="size-4" fill="currentColor" aria-hidden>
+      <svg
+        viewBox="0 0 16 16"
+        className="size-4"
+        fill="currentColor"
+        aria-hidden
+      >
         <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
       </svg>
     </Button>

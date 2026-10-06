@@ -1,6 +1,7 @@
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, join, resolve, sep } from "node:path"
+import { pathToFileURL } from "node:url"
 import { describe, expect, test, vi } from "vitest"
 import type { AgentAdapter, DiscoveryContext, UsageSource } from "../types"
 import { ampAdapter } from "./amp"
@@ -37,9 +38,11 @@ describe("whole-file JSON adapters", () => {
     const home = await mkdtemp(join(tmpdir(), "stats-amp-"))
     const data = join(home, "data")
     const path = join(data, "amp", "threads", "T-one.json")
-    await json(path, { id: "thread", created: 1767312000000, env: { initial: { workspaceRoot: "/tmp/worktree/", trees: [{ uri: "file:///other", repository: { url: "/work/other" } }, { uri: "file:///tmp/worktree", repository: { url: "/work/app/." } }] } }, messages: [{ role: "assistant", usage: { model: "wrong", inputTokens: 99 } }], usageLedger: { events: [{ timestamp: "2026-01-02T00:00:00Z", model: "claude-sonnet", credits: 0.25, tokens: { input: 11, output: 5, cacheReadInputTokens: 3, cacheCreationInputTokens: 2 } }] } })
+    // Native paths and file URLs: Windows rejects a file URL without a drive.
+    const worktree = join(home, "worktree")
+    await json(path, { id: "thread", created: 1767312000000, env: { initial: { workspaceRoot: `${worktree}${sep}`, trees: [{ uri: pathToFileURL(join(home, "other")).href, repository: { url: "/work/other" } }, { uri: pathToFileURL(worktree).href, repository: { url: "/work/app/." } }] } }, messages: [{ role: "assistant", usage: { model: "wrong", inputTokens: 99 } }], usageLedger: { events: [{ timestamp: "2026-01-02T00:00:00Z", model: "claude-sonnet", credits: 0.25, tokens: { input: 11, output: 5, cacheReadInputTokens: 3, cacheCreationInputTokens: 2 } }] } })
     const source = await first(ampAdapter, home, { XDG_DATA_HOME: data })
-    expect((await ampAdapter.parse(source, parseContext())).events[0]).toMatchObject({ project: "/work/app", tokens: { input: 11, output: 5, cacheRead: 3, cacheWrite: 2, reasoning: 0 }, costUsd: 0.25, costSource: "reported" })
+    expect((await ampAdapter.parse(source, parseContext())).events[0]).toMatchObject({ project: resolve("/work/app"), tokens: { input: 11, output: 5, cacheRead: 3, cacheWrite: 2, reasoning: 0 }, costUsd: 0.25, costSource: "reported" })
   })
 
   test("Amp uses timestamped usage from actor snapshots", async () => {
@@ -48,7 +51,7 @@ describe("whole-file JSON adapters", () => {
     const path = join(data, "amp", "threads", "T-actor.json")
     await json(path, { id: "T-actor", created: 1767225600000, env: { initial: { workspaceRoot: "/work/app/" } }, messages: [{ messageId: "M-one", role: "assistant", createdAt: "2026-01-02T00:00:02Z", usage: { timestamp: "2026-01-02T00:00:01Z", model: "gpt-5", inputTokens: 7, outputTokens: 3 } }] })
     const source = await first(ampAdapter, home, { XDG_DATA_HOME: data })
-    expect((await ampAdapter.parse(source, parseContext())).events[0]).toMatchObject({ sessionId: "T-actor", project: "/work/app", timestamp: 1767312001000, model: "gpt-5", tokens: { input: 7, output: 3 } })
+    expect((await ampAdapter.parse(source, parseContext())).events[0]).toMatchObject({ sessionId: "T-actor", project: resolve("/work/app"), timestamp: 1767312001000, model: "gpt-5", tokens: { input: 7, output: 3 } })
   })
 
   test("Droid maps settings totals and project sidecar directory", async () => {

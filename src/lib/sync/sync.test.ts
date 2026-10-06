@@ -8,7 +8,7 @@ import {
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import Database from "better-sqlite3"
-import { afterEach, beforeEach, describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { codexAdapter } from "../agents/adapters/codex"
 import { closeDb, getDb } from "../db/client.server"
 import { syncUsage } from "./sync.server"
@@ -72,12 +72,21 @@ describe("syncUsage", () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "ts-home-"))
     dataDir = mkdtempSync(join(tmpdir(), "ts-data-"))
-    process.env.TELEMETRY_STATS_DATA_DIR = dataDir
-    process.env.HOME = home
+    vi.stubEnv("TELEMETRY_STATS_DATA_DIR", dataDir)
+    // Point every base directory adapters search at the temp home, so a sync never
+    // reads the real agent logs. os.homedir() reads USERPROFILE on Windows, not HOME.
+    vi.stubEnv("HOME", home)
+    vi.stubEnv("USERPROFILE", home)
+    vi.stubEnv("APPDATA", join(home, "AppData", "Roaming"))
+    vi.stubEnv("LOCALAPPDATA", join(home, "AppData", "Local"))
+    vi.stubEnv("XDG_DATA_HOME", join(home, ".local", "share"))
+    vi.stubEnv("XDG_CONFIG_HOME", join(home, ".config"))
     writePricingCache()
   })
 
   afterEach(() => {
+    vi.unstubAllEnvs()
+    vi.unstubAllGlobals()
     closeDb()
     rmSync(home, { recursive: true, force: true })
     rmSync(dataDir, { recursive: true, force: true })
@@ -653,6 +662,9 @@ describe("syncUsage", () => {
 
   it("leaves costs null and unpriced for unknown models without a catalog", async () => {
     rmSync(join(dataDir, "models-dev.json"))
+    // Without a cached catalog the loader fetches models.dev; keep the test offline so
+    // a slow network can't time it out and leave its sync running into the next test.
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("offline")))
     writeOmpSession([
       HEADER,
       JSON.stringify({

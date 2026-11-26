@@ -7,6 +7,7 @@ import {
 } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { pathToFileURL } from "node:url"
 import Database from "better-sqlite3"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { codexAdapter } from "../agents/adapters/codex"
@@ -90,6 +91,105 @@ describe("syncUsage", () => {
     closeDb()
     rmSync(home, { recursive: true, force: true })
     rmSync(dataDir, { recursive: true, force: true })
+  })
+
+  it("imports Antigravity CLI generations, including commits still in the WAL", async () => {
+    vi.stubEnv("GEMINI_CLI_HOME", join(home, ".gemini"))
+    const dir = join(home, ".gemini", "antigravity-cli", "conversations")
+    mkdirSync(dir, { recursive: true })
+    const writer = new Database(join(dir, "conversation.db"))
+    try {
+      writer.pragma("journal_mode = WAL")
+      writer.pragma("wal_autocheckpoint = 0")
+      writer.exec(`
+        CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB);
+        CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);
+        CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);
+      `)
+      const varint = (value: number): number[] => {
+        const bytes = []
+        while (value >= 128) {
+          bytes.push((value & 0x7f) | 0x80)
+          value >>>= 7
+        }
+        return [...bytes, value]
+      }
+      const field = (id: number, value: Buffer | string): Buffer => {
+        const bytes = typeof value === "string" ? Buffer.from(value) : value
+        return Buffer.concat([
+          Buffer.from([...varint((id << 3) | 2), ...varint(bytes.length)]),
+          bytes,
+        ])
+      }
+      const workspace = pathToFileURL(join(home, "My Project")).href
+      writer
+        .prepare("INSERT INTO trajectory_metadata_blob VALUES ('main', ?)")
+        .run(field(1, field(1, workspace)))
+      const addGeneration = (idx: number, seconds: string): void => {
+        const responseId = `response-${idx}`
+        // Model enum 1132, input 10, total output 25, cache write 2,
+        // cache read 3, thinking 5, response output 20.
+        const usage = Buffer.concat([
+          Buffer.from("08ec08100a18192002280348055014", "hex"),
+          field(11, responseId),
+        ])
+        const generation = field(
+          1,
+          Buffer.concat([field(4, usage), field(19, "gemini-4-neon")])
+        )
+        const step = Buffer.concat([
+          field(1, Buffer.from(`08${seconds}`, "hex")),
+          field(9, usage),
+        ])
+        writer
+          .prepare("INSERT INTO gen_metadata VALUES (?, ?)")
+          .run(idx, generation)
+        // A step's index and a generation's index are independent.
+        writer.prepare("INSERT INTO steps VALUES (?, ?)").run(idx + 10, step)
+      }
+
+      addGeneration(0, "c0bfb7d306")
+      writer.pragma("wal_checkpoint(TRUNCATE)")
+      const options = { agents: ["antigravity-cli" as const] }
+      expect(await syncUsage(options)).toMatchObject({
+        processed: 1,
+        inserted: 1,
+        warnings: 0,
+      })
+      addGeneration(1, "c0e2bcd306")
+      expect(await syncUsage(options)).toMatchObject({
+        processed: 1,
+        inserted: 2,
+        warnings: 0,
+      })
+      expect(await syncUsage(options)).toMatchObject({
+        skipped: 1,
+        inserted: 0,
+      })
+
+      const rows = getDb()
+        .prepare(
+          `SELECT session_id, timestamp, model, project, input_tokens, output_tokens,
+                reasoning_tokens, cache_read_tokens, cache_write_tokens
+         FROM usage_events WHERE agent = 'antigravity-cli' ORDER BY timestamp`
+        )
+        .all()
+      expect(rows).toEqual(
+        ["2026-08-01T12:00:00Z", "2026-08-02T12:00:00Z"].map((date) => ({
+          session_id: "conversation",
+          timestamp: Date.parse(date),
+          model: "gemini-4-neon",
+          project: join(home, "My Project"),
+          input_tokens: 10,
+          output_tokens: 20,
+          reasoning_tokens: 5,
+          cache_read_tokens: 3,
+          cache_write_tokens: 2,
+        }))
+      )
+    } finally {
+      writer.close()
+    }
   })
 
   it("migrates stored sources to persisted resume state", () => {

@@ -129,7 +129,7 @@ async function runSync(options: SyncOptions): Promise<SyncResult> {
         continue
       }
       const known = selectSource.get(source.path) as SourceRow | undefined
-      let sampleHash = await sampleFileHash(source.path, stat.size)
+      let sampleHash = await sampleSourceHash(source, stat.size)
       const unchanged =
         known &&
         known.adapter_version === adapter.version &&
@@ -153,7 +153,7 @@ async function runSync(options: SyncOptions): Promise<SyncResult> {
         known.cursor >= 0 &&
         known.cursor <= known.size &&
         stat.size > known.size &&
-        (await sampleFileHash(source.path, known.size)) === known.sample_hash
+        (await sampleSourceHash(source, known.size)) === known.sample_hash
       ) {
         resumeOffset = known.cursor
       }
@@ -174,8 +174,8 @@ async function runSync(options: SyncOptions): Promise<SyncResult> {
             warn: () => attemptWarnings++,
           })
           const parsedStat = await fs.stat(source.path)
-          const parsedSampleHash = await sampleFileHash(
-            source.path,
+          const parsedSampleHash = await sampleSourceHash(
+            source,
             parsedStat.size
           )
           const stable =
@@ -354,6 +354,24 @@ function recordAgentError(
 /** Error text safe to persist: message only, never file content. */
 function describeError(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).slice(0, 500)
+}
+
+async function sampleSourceHash(
+  source: UsageSource,
+  size: number
+): Promise<string> {
+  const hash = await sampleFileHash(source.path, size)
+  if (source.kind !== "sqlite") return hash
+
+  // A commit can update the WAL while leaving the main database file unchanged.
+  const wal = await fs
+    .stat(`${source.path}-wal`, { bigint: true })
+    .catch(() => null)
+  if (!wal || wal.size === 0n) return hash
+  return createHash("sha256")
+    .update(`${hash}:${wal.ino}:${wal.size}:${wal.mtimeNs}:${wal.ctimeNs}`)
+    .digest("hex")
+    .slice(0, 24)
 }
 
 /** Hash 4KB samples at five evenly spaced offsets; cheap change detection. */
